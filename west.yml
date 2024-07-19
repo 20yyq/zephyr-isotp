@@ -1,0 +1,70 @@
+# Copyright (c) 2021 Nordic Semiconductor ASA
+# SPDX-License-Identifier: Apache-2.0
+
+manifest:
+  self:
+    west-commands: scripts/west-commands.yml
+
+  remotes:
+    - name: zephyrproject-rtos
+      url-base: https://github.com/zephyrproject-rtos
+
+  projects:
+    - name: zephyr
+      remote: zephyrproject-rtos
+      # revision: v3.6.0
+      revision: v3.7.0-rc2
+      import:
+        # By using name-allowlist we can clone only the modules that are
+        # strictly needed by the application.
+        name-allowlist:
+          - acpica
+          - cmsis
+          - cmsis-dsp
+          - cmsis-nn
+          - edtt
+          - fatfs
+          - hal_adi
+          - hal_altera
+          - hal_ambiq
+          - hal_espressif
+          - hal_ethos_u
+          - hal_gigadevice
+          - hal_infineon
+          - hal_intel
+          - hal_microchip
+          - hal_nordic
+          - hal_nuvoton
+          - hal_nxp
+          - hal_openisa
+          - hal_quicklogic
+          - hal_renesas
+          - hal_rpi_pico
+          - hal_silabs
+          - hal_st
+          - hal_stm32
+          - hal_telink
+          - hal_ti
+          - hal_wurthelektronik
+          - hal_xtensa
+          - hostap
+          - libmetal
+          - liblc3
+          - littlefs
+          - loramac-node
+          - lvgl
+          - mbedtls
+          - mcuboot
+          - mipi-sys-t
+          - net-tools
+          - nrf_hw_models
+          - open-amp
+          - openthread
+          - percepio
+          - picolibc
+          - segger
+          - tinycrypt
+          - trusted-firmware-m
+          - trusted-firmware-a
+          - uoscore-uedhoc
+          - zcbor

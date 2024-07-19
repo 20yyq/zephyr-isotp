@@ -1,0 +1,183 @@
+# Copyright (c) 2021, Legrand North America, LLC.
+# SPDX-License-Identifier: Apache-2.0
+
+
+config VISOTP_CONN
+	bool "Support for custom library"
+	help
+	  This option enables the 'custom' library
+
+if VISOTP_CONN
+
+module = VISOTP_CONN
+module-str = visotp_conn
+source "subsys/logging/Kconfig.template.log_config"
+
+endif # VISOTP_CONN
+
+# config VISOTP_BUF_SIZE
+# 	int "Size of one buffer data block"
+# 	default 63 if CAN_FD_MODE
+# 	default 56
+# 	help
+# 	  This value defines the size of a single block in the pool. The number of
+# 	  blocks is given by VISOTP_RX_BUF_COUNT / VISOTP_TX_BUF_COUNT. To be efficient use a multiple of
+# 	  CAN_MAX_DLEN - 1 (for classic CAN : 8 - 1 = 7, for CAN-FD : 64 - 1 = 63).
+
+# config VISOTP_RX_BUF_COUNT
+# 	int "Number of data buffers for receiving data"
+# 	default 4
+# 	help
+# 	  Each data buffer will occupy VISOTP_BUF_SIZE + smallish
+# 	  header (sizeof(struct net_buf)) amount of data.
+
+# config VISOTP_TX_BUF_COUNT
+# 	int "Number of data buffers for sending data"
+# 	default 4
+# 	help
+# 	  Each data buffer will occupy VISOTP_BUF_SIZE + smallish
+# 	  header (sizeof(struct net_buf)) amount of data. If context buffers
+# 	  are used, use the same size here.
+
+# config VISOTP_BS_TIMEOUT
+# 	int "Bs timeout [ms] (timeout for receiving the frame control)"
+# 	default 1000
+# 	range 200 10000
+# 	help
+# 	  Timeout for the reception of the next FC frame. ISO 15765-2: 1000ms
+
+# config VISOTP_A_TIMEOUT
+# 	int "Ar and As timeout [ms] (sending and receiving timeout)"
+# 	default 1000
+# 	range 200 10000
+# 	help
+# 	  As (sender transmit timeout) and Ar (receiver transmit timeout).
+# 	  ISO 15765-2: 1000ms
+
+# config VISOTP_CR_TIMEOUT
+# 	int "Cr timeout [ms] (timeout for consecutive frames)"
+# 	default 200
+# 	range 10 200
+# 	help
+# 	  Cr (receiver consecutive frame) timeout.
+
+
+
+
+
+# config VISOTP_WFTMAX
+# 	int "WFTmax (Max WAIT frames before aborting)."
+# 	default 10
+# 	range 0 254
+# 	help
+# 	  This value defines the maximum number of WAIT frames before the transmission
+# 	  is aborted.
+
+# config VISOTP_REQUIRE_RX_PADDING
+# 	bool "Require padding for received messages"
+# 	help
+# 	  If enabled, SFs, FCs and the last CF must always have a DLC of 8 bytes
+# 	  (for classic CAN) and unused bytes must be padded by the sending
+# 	  device. This setting allows to be compliant to AUTOSAR Specification
+# 	  of CAN Transport Layer.
+
+# 	  By default, received CAN frames with or without padding are accepted.
+
+# config VISOTP_ENABLE_TX_PADDING
+# 	bool "Padding for transmitted messages"
+# 	default y if VISOTP_REQUIRE_RX_PADDING
+# 	help
+# 	  Add padding bytes 0xCC (as recommended by Bosch) if the PDU payload
+# 	  does not fit exactly into the CAN frame.
+
+# config VISOTP_RX_SF_FF_BUF_COUNT
+# 	int "Number of SF and FF data buffers for receiving data"
+# 	default 4
+# 	help
+# 	  This buffer is used for first and single frames. It is extra because the
+# 	  buffer has to be ready for the first reception in isr context and therefor
+# 	  is allocated when binding.
+# 	  Each buffer will occupy CAN_MAX_DLEN - 1 byte + header (sizeof(struct net_buf))
+# 	  amount of data.
+
+# config VISOTP_USE_TX_BUF
+# 	bool "Buffer tx writes"
+# 	help
+# 	  Copy the outgoing data to a net buffer so that the calling function
+# 	  can discard the data.
+
+# config VISOTP_BUF_TX_DATA_POOL_SIZE
+# 	int "Size of the memory pool where buffers are allocated from"
+# 	default 256
+# 	help
+# 	  This value defines the size of the memory pool where the buffers
+# 	  for sending are allocated from.
+
+# config VISOTP_ENABLE_CONTEXT_BUFFERS
+# 	bool "Buffered tx contexts"
+# 	default y
+# 	help
+# 	  This option enables buffered sending contexts. This makes send and
+# 	  forget possible. A memory slab is used to buffer the context.
+
+# config VISOTP_TX_CONTEXT_BUF_COUNT
+# 	int "Amount of context buffers for sending data"
+# 	default 4
+# 	depends on VISOTP_ENABLE_CONTEXT_BUFFERS
+# 	help
+# 	  This defines the size of the memory slab where the buffers are
+# 	  allocated from.
+
+# config VISOTP_CUSTOM_FIXED_ADDR
+# 	bool "Use fixed address not compatible with SAE J1939"
+# 	default n
+# 	help
+# 	  This option allow to use an alternative CAN frame id format.
+# 	  If not set ISO-TP fixed addressing use SAE J1939 standard.
+
+# menu "Fixed address definition"
+# 	visible if VISOTP_CUSTOM_FIXED_ADDR
+
+# config VISOTP_FIXED_ADDR_SA_POS
+# 	int "Position of fixed source address (SA)"
+# 	default 0
+# 	help
+# 	  Source address position in bits.
+
+# config VISOTP_FIXED_ADDR_SA_MASK
+# 	hex "Mask to obtain fixed source address (SA)"
+# 	default 0xFF
+# 	help
+# 	  Source address mask.
+
+# config VISOTP_FIXED_ADDR_TA_POS
+# 	int "Position of fixed target address (TA)"
+# 	default 8
+# 	help
+# 	  Target address position in bits.
+
+# config VISOTP_FIXED_ADDR_TA_MASK
+# 	hex "Mask to obtain fixed target address (TA)"
+# 	default 0xFF00
+# 	help
+# 	  Target address mask.
+
+# config VISOTP_FIXED_ADDR_PRIO_POS
+# 	int "Position of priority in fixed addressing mode"
+# 	default 26
+# 	help
+# 	  Priority address position in bits.
+
+# config VISOTP_FIXED_ADDR_PRIO_MASK
+# 	hex "Mask for priority in fixed addressing mode"
+# 	default 0x1C000000
+# 	help
+# 	  Priority address mask.
+
+# config VISOTP_FIXED_ADDR_RX_MASK
+# 	hex "CAN filter RX mask to match any priority and source address (SA)"
+# 	default 0x03FFFF00
+# 	help
+# 	  CAN filter RX mask
+
+# endmenu

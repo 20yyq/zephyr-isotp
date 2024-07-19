@@ -1,0 +1,60 @@
+# Copyright (c) 2021, Legrand North America, LLC.
+# SPDX-License-Identifier: Apache-2.0
+
+config VISOTP
+	bool "Support for custom library"
+	help
+	  This option enables the 'custom' library
+
+if VISOTP
+
+module = VISOTP
+module-str = visotp
+source "subsys/logging/Kconfig.template.log_config"
+
+endif # VISOTP
+
+config VISOTP_BUF_SIZE
+	int "Size of one buffer data block"
+	default 64
+	help
+	  This value defines the size of a single block in the pool. The number of
+	  blocks is given by VISOTP_RX_BUF_COUNT / VISOTP_TX_BUF_COUNT. To be efficient use a multiple of
+	  CAN_MAX_DLEN - 1 (for classic CAN : 8 - 1 = 7, for CAN-FD : 64 - 1 = 63).
+
+config VISOTP_RX_BUF_COUNT
+	int "Number of data buffers for receiving data"
+	default 4
+	help
+	  Each data buffer will occupy VISOTP_BUF_SIZE + smallish
+	  header (sizeof(struct net_buf)) amount of data.
+
+config VISOTP_TX_BUF_COUNT
+	int "Number of data buffers for sending data"
+	default 4
+	help
+	  Each data buffer will occupy VISOTP_BUF_SIZE + smallish
+	  header (sizeof(struct net_buf)) amount of data. If context buffers
+	  are used, use the same size here.
+
+config VISOTP_BS_TIMEOUT
+	int "Bs timeout [ms] (timeout for receiving the frame control)"
+	default 1000
+	range 200 10000
+	help
+	  Timeout for the reception of the next FC frame. ISO 15765-2: 1000ms
+
+config VISOTP_A_TIMEOUT
+	int "Ar and As timeout [ms] (sending and receiving timeout)"
+	default 1000
+	range 200 10000
+	help
+	  As (sender transmit timeout) and Ar (receiver transmit timeout).
+	  ISO 15765-2: 1000ms
+
+config VISOTP_CR_TIMEOUT
+	int "Cr timeout [ms] (timeout for consecutive frames)"
+	default 200
+	range 10 200
+	help
+	  Cr (receiver consecutive frame) timeout.
