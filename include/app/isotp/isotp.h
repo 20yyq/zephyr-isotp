@@ -146,9 +146,9 @@ struct tpconn {
 
 struct linux_isotp_sock {
 	const struct device *can_dev;
-	bool close;
+	int close;
 	struct k_mutex mutex;
-	struct k_work work;
+	struct k_work_delayable work;
 	k_timeout_t tx_gap;
 	int filter_id;
 	struct tpconn rx, tx;
