@@ -787,7 +787,7 @@ static void sf_ff_wait_end_frame_cb(const struct device *dev, int error, void *a
 			k_timer_stop(&frame->sk->tx.timer);
 			frame->sk->tx.state = ISOTP_SEND_ERR;
 			k_timer_start(&frame->sk->tx.timer, K_NO_WAIT, K_NO_WAIT);
-			LOG_ERR("send flow frame error: [%d]", error);
+			LOG_ERR("send sf/ff/wait cf/end frame error: [%d]", error);
 			return;
 		}
 		switch (frame->sk->tx.state)
@@ -843,7 +843,7 @@ static int isotp_send_sf(struct linux_isotp_sock *sk) {
 	LOG_DBG("single are done");
 	sk->tx.state = ISOTP_SEND_SF;
 	k_timer_start(&sk->tx.timer, K_MSEC(CONFIG_VISOTP_A_TIMEOUT), K_NO_WAIT);
-	return isotp_send_frame(isotp_send_flow_frame_cb, frame);
+	return isotp_send_frame(sf_ff_wait_end_frame_cb, frame);
 }
 
 static int isotp_send_ff(struct linux_isotp_sock *sk) {
@@ -876,8 +876,9 @@ static int isotp_send_ff(struct linux_isotp_sock *sk) {
 	}
 	sk->tx.sn = 1;
 	sk->tx.state = ISOTP_SEND_FF;
+	LOG_DBG("first frame are done");
 	k_timer_start(&sk->tx.timer, K_MSEC(CONFIG_VISOTP_A_TIMEOUT), K_NO_WAIT);
-	return isotp_send_frame(isotp_send_flow_frame_cb, frame);
+	return isotp_send_frame(sf_ff_wait_end_frame_cb, frame);
 }
 
 static inline int isotp_send_cf(struct linux_isotp_sock *sk)
@@ -895,7 +896,7 @@ static inline int isotp_send_cf(struct linux_isotp_sock *sk)
 	sk->tx.sn %= 16;
 
 	/* add first data bytes depending on item */
-	for (int i = item; i < sk->tx.addr.dlc; i++)
+	for (int i = item; i < frame->frame.dlc; i++)
 	{
 		if (!sk->tx.next->len)
 			sk->tx.next = sk->tx.next->frags;
@@ -906,7 +907,6 @@ static inline int isotp_send_cf(struct linux_isotp_sock *sk)
 	can_tx_callback_t callback = isotp_send_flow_frame_cb;
 	if (sk->tx.fc.bs && sk->tx.bs++ == sk->tx.fc.bs)
 	{
-		/* stop and wait for FC */
 		LOG_DBG("BS stop and wait for FC");
 		sk->tx.state = ISOTP_WAIT_FC_START;
 		callback = sf_ff_wait_end_frame_cb;
@@ -914,8 +914,7 @@ static inline int isotp_send_cf(struct linux_isotp_sock *sk)
 
 	if (sk->tx.idx >= sk->tx.len)
 	{
-		/* we are done */
-		LOG_DBG("we are done");
+		LOG_DBG("pack are done");
 		sk->tx.state = ISOTP_SEND_END;
 		callback = sf_ff_wait_end_frame_cb;
 	}
