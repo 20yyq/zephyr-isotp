@@ -51,13 +51,13 @@ enum {
 	ISOTP_WAIT_FC,
 	ISOTP_WAIT_FC_START,
 	ISOTP_WAIT_DATA,
-	ISOTP_WAIT_DATA_END,
 	ISOTP_WAIT_FF_SF,
 	ISOTP_SEND_SF,
 	ISOTP_SEND_FF,
 	ISOTP_SEND_CF,
 	ISOTP_SENDING,
 	ISOTP_SEND_END,
+	ISOTP_SEND_END_OK,
 	ISOTP_SEND_FC_ERR,
 	ISOTP_SEND_ERR,
 	ISOTP_POOL_ALLOC_BUF_ERR
@@ -66,7 +66,6 @@ enum {
 struct isotp_frame
 {
 	struct can_frame frame;
-	uint64_t send_num;
 	struct linux_isotp_sock *sk;
 };
 
@@ -77,10 +76,11 @@ struct callback_timer {
 	struct k_timer timer;
 };
 
-K_MUTEX_DEFINE(sk_list_mutex);
-static struct linux_isotp_sock *sk_list[CONFIG_CAN_MAX_FILTER] = {NULL};
-
 LOG_MODULE_REGISTER(isotp, CONFIG_VISOTP_LOG_LEVEL);
+
+static void receive_work_handler(struct k_work *work);
+static K_WORK_DEFINE(receive_work, receive_work_handler);
+static K_FIFO_DEFINE(receive_fifo);
 
 NET_BUF_POOL_DEFINE(isotp_receive_pool, CONFIG_VISOTP_RX_BUF_COUNT, CONFIG_VISOTP_BUF_SIZE, sizeof(uint32_t), NULL);
 NET_BUF_POOL_DEFINE(isotp_send_pool, CONFIG_VISOTP_TX_BUF_COUNT, CONFIG_VISOTP_BUF_SIZE, sizeof(uint32_t), NULL);
@@ -96,6 +96,11 @@ static inline struct net_buf *from_pool_add_net_buf_data(struct net_buf_pool *po
 	do
 	{
 		max = net_buf_tailroom(buf);
+		if (max < 0)
+		{
+			LOG_ERR("net_buf buffer is NULL");
+			return NULL;
+		}
 		for (idx = 0; idx < max; idx++)
 		{
 			net_buf_add_u8(buf, data[len - item]);
@@ -115,6 +120,20 @@ static inline struct net_buf *from_pool_add_net_buf_data(struct net_buf_pool *po
 		}
 	} while (item);
 	return buf;
+}
+
+static inline void set_gap(struct isotp_fc_opts *fc)
+{
+	/* fix wrong STmin values according spec */
+	if (fc->stmin > 0xF9 || (fc->stmin > ISOTP_STMIN_MS_MAX && fc->stmin < 0xF1))
+	{
+		fc->stmin = ISOTP_STMIN_MS_MAX;
+		fc->gap = K_MSEC(ISOTP_STMIN_MS_MAX);
+	}
+	else if (fc->stmin < 0x80)
+		fc->gap = K_MSEC(fc->stmin);
+	else
+		fc->gap = K_USEC((fc->stmin - 0xF0) * 100U);
 }
 
 static void callback_timer_handler(struct k_timer *arg)
@@ -163,11 +182,6 @@ static void receive_timeout_handler(struct k_timer *timer)
 		sk->rx.state = ISOTP_WAIT_FF_SF;
 		net_buf_unref(sk->rx.buf);
 		break;
-	case ISOTP_WAIT_DATA_END:
-		sk->rx.state = ISOTP_WAIT_FF_SF;
-		net_buf_put(&sk->fifo, sk->rx.buf);
-		sk->rx.buf = NULL;
-		break;
 	}
 	return;
 }
@@ -189,7 +203,6 @@ static void send_timeout_handler(struct k_timer *timer)
 		inline_callback_timer(sk->callback, ISOTP_N_ERROR, sk->args);
 		sk->callback = NULL;
 		sk->tx.state = ISOTP_IDLE;
-		net_buf_unref(sk->tx.buf);
 		break;
 
 	case ISOTP_WAIT_FIRST_FC:
@@ -197,7 +210,6 @@ static void send_timeout_handler(struct k_timer *timer)
 		inline_callback_timer(sk->callback, ISOTP_N_TIMEOUT_BS, sk->args);
 		sk->callback = NULL;
 		sk->tx.state = ISOTP_IDLE;
-		net_buf_unref(sk->tx.buf);
 		break;
 
 	case ISOTP_WAIT_FC:
@@ -205,7 +217,6 @@ static void send_timeout_handler(struct k_timer *timer)
 		inline_callback_timer(sk->callback, ISOTP_N_TIMEOUT_BS, sk->args);
 		sk->callback = NULL;
 		sk->tx.state = ISOTP_IDLE;
-		net_buf_unref(sk->tx.buf);
 		break;
 
 	case ISOTP_SENDING:
@@ -214,8 +225,12 @@ static void send_timeout_handler(struct k_timer *timer)
 			inline_callback_timer(sk->callback, ISOTP_NO_CTX_LEFT, sk->args);
 			sk->callback = NULL;
 			sk->tx.state = ISOTP_IDLE;
-			net_buf_unref(sk->tx.buf);
 		}
+		break;
+	case ISOTP_SEND_END_OK:
+		inline_callback_timer(sk->callback, ISOTP_N_OK, sk->args);
+		sk->callback = NULL;
+		sk->tx.state = ISOTP_IDLE;
 		break;
 	}
 }
@@ -223,22 +238,16 @@ static void send_timeout_handler(struct k_timer *timer)
 static void isotp_send_fc_can_cb(const struct device *dev, int error, void *arg)
 {
 	struct isotp_frame *frame = (struct isotp_frame *)arg;
-	if (!frame->send_num)
-	{
-		LOG_ERR("isotp_send_fc_can_cb send_num is zero");
-		return;
-	}
-	frame->send_num--;
+	frame->sk->send_num--;
 	if (error)
 	{
-		if (!frame->send_num)
-		{
-			k_timer_stop(&frame->sk->rx.timer);
-			frame->sk->rx.state = ISOTP_SEND_FC_ERR;
-			k_timer_start(&frame->sk->rx.timer, K_NO_WAIT, K_NO_WAIT);
-		}
-		LOG_ERR("send fc error: [%d] send_num [%lld]", error, frame->send_num);
+		k_timer_stop(&frame->sk->rx.timer);
+		frame->sk->rx.state = ISOTP_SEND_FC_ERR;
+		k_timer_start(&frame->sk->rx.timer, K_NO_WAIT, K_NO_WAIT);
+		LOG_ERR("send fc error: [%d] send_num [%lld]", error, frame->sk->send_num);
 	}
+	memset(frame, 0, sizeof(struct isotp_frame));
+	k_mem_slab_free(&isotp_frame_slab, frame);
 }
 
 static inline int isotp_send_frame(can_tx_callback_t callback, struct isotp_frame *frame) 
@@ -247,18 +256,27 @@ static inline int isotp_send_frame(can_tx_callback_t callback, struct isotp_fram
 	frame->frame.flags = (frame->sk->tx.addr.flags & ISOTP_PKG_IDE ? CAN_FRAME_IDE : 0) |
 		       (frame->sk->tx.addr.flags & ISOTP_PKG_FDF ? CAN_FRAME_FDF : 0) |
 		       (frame->sk->tx.addr.flags & ISOTP_PKG_BRS ? CAN_FRAME_BRS : 0);
-	frame->send_num++;
-	int ret = can_send(frame->sk->can_dev, &frame->frame, K_MSEC(CONFIG_VISOTP_A_TIMEOUT), callback, frame);
+	frame->sk->send_num++;
+	int ret = can_send(frame->sk->can_dev, &frame->frame, K_NO_WAIT, callback, frame);
 	if (ret)
 	{
-		frame->send_num--;
-		LOG_ERR("Can't send Frame, (%d) send_num [%lld]", ret, frame->send_num);
+		frame->sk->send_num--;
+		LOG_ERR("Can't send Frame, (%d) send_num [%lld]", ret, frame->sk->send_num);
+		memset(frame, 0, sizeof(struct isotp_frame));
+		k_mem_slab_free(&isotp_frame_slab, frame);
 	}
 	return ret;
 }
 
-static int isotp_send_fc(struct isotp_frame *frame, uint8_t flowstatus)
+static int isotp_send_fc(struct linux_isotp_sock *sk, uint8_t flowstatus)
 {
+	struct isotp_frame *frame = NULL;
+	if (k_mem_slab_alloc(&isotp_frame_slab, (void **)&frame, K_NO_WAIT))
+	{
+		LOG_ERR("isotp_frame_slab k_mem_slab_alloc: NULL");
+		return 1;
+	}
+	frame->sk = sk;
 	int item = frame->sk->tx.addr.flags & ISOTP_PKG_EXT_ADDR ? 1 : 0;
 	if (item)
 		frame->frame.data[item - 1] = frame->sk->tx.addr.ext_addr;
@@ -285,17 +303,7 @@ static inline void isotp_rcv_fc(struct linux_isotp_sock *sk, struct can_frame *c
 	{
 		sk->tx.fc.bs = cf->data[item + 1];
 		sk->tx.fc.stmin = cf->data[item + 2];
-
-		/* fix wrong STmin values according spec */
-		if (sk->tx.fc.stmin > 0xF9 || (sk->tx.fc.stmin > ISOTP_STMIN_MS_MAX && sk->tx.fc.stmin < 0xF1))
-		{
-			sk->tx.fc.stmin = ISOTP_STMIN_MS_MAX;
-			sk->tx_gap = K_MSEC(ISOTP_STMIN_MS_MAX);
-		}
-		else if (sk->tx.fc.stmin < 0x80)
-			sk->tx_gap = K_MSEC(sk->tx.fc.stmin);
-		else
-			sk->tx_gap = K_USEC((sk->tx.fc.stmin - 0xF0) * 100U);
+		set_gap(&sk->tx.fc);
 	}
 
 	k_timeout_t tx_gap = K_NO_WAIT;
@@ -331,14 +339,6 @@ static inline void isotp_rcv_fc(struct linux_isotp_sock *sk, struct can_frame *c
 
 static inline void isotp_rcv_sf(struct linux_isotp_sock *sk, struct can_frame *cf, int item)
 {
-	k_mutex_lock(&sk->mutex, K_FOREVER);
-	int close = sk->close & 0xFFFFFFFF;
-	k_mutex_unlock(&sk->mutex);
-	if (close)
-	{
-		LOG_ERR("sf close...................... filter_id[%d]", sk->filter_id);
-		return;
-	}
 	if (sk->rx.state != ISOTP_WAIT_FF_SF)
 	{
 		LOG_ERR("sk->rx.state != VISOTP_RX_STATE_WAIT_SF state: [%d]", sk->rx.state);
@@ -366,7 +366,13 @@ static inline void isotp_rcv_sf(struct linux_isotp_sock *sk, struct can_frame *c
 		return;
 	}
 	net_buf_add_le32(sk->rx.buf, sk->rx.len);
-	from_pool_add_net_buf_data(&isotp_receive_pool, sk->rx.buf, &cf->data[item + sf_dl], sk->rx.len);
+	if (!from_pool_add_net_buf_data(&isotp_receive_pool, sk->rx.buf, &cf->data[item + sf_dl], sk->rx.len))
+	{
+		LOG_ERR("sf from_pool_add_net_buf_data net buf == NULL");
+		sk->rx.state = ISOTP_WAIT_FF_SF;
+		net_buf_unref(sk->rx.buf);
+		return;
+	}
 	net_buf_put(&sk->fifo, sk->rx.buf);
 	sk->rx.buf = NULL;
 	sk->rx.state = ISOTP_WAIT_FF_SF;
@@ -374,14 +380,6 @@ static inline void isotp_rcv_sf(struct linux_isotp_sock *sk, struct can_frame *c
 
 static inline void isotp_rcv_ff(struct linux_isotp_sock *sk, struct can_frame *cf, int item)
 {
-	k_mutex_lock(&sk->mutex, K_FOREVER);
-	int close = sk->close & 0xFFFFFFFF;
-	k_mutex_unlock(&sk->mutex);
-	if (close)
-	{
-		LOG_ERR("ff close...................... filter_id[%d] [%p]", sk->filter_id, sk);
-		return;
-	}
 	if (sk->rx.state != ISOTP_WAIT_FF_SF)
 	{
 		LOG_ERR("sk->rx.state != VISOTP_RX_STATE_WAIT_FF state: [%d] len [%d] idx [%d]", sk->rx.state, sk->rx.len, sk->rx.idx);
@@ -415,7 +413,7 @@ static inline void isotp_rcv_ff(struct linux_isotp_sock *sk, struct can_frame *c
 	if (sk->rx.len > (CONFIG_VISOTP_RX_BUF_COUNT * CONFIG_VISOTP_BUF_SIZE))
 	{
 		/* send FC frame with overflow status */
-		isotp_send_fc((struct isotp_frame *)sk->rx.focus, ISOTP_FC_OVFLW);
+		isotp_send_fc(sk, ISOTP_FC_OVFLW);
 		sk->rx.state = ISOTP_WAIT_FF_SF;
 		LOG_WRN("ISOTP_FC_OVFLW len: [%d]", sk->rx.len);
 		return;
@@ -433,9 +431,15 @@ static inline void isotp_rcv_ff(struct linux_isotp_sock *sk, struct can_frame *c
 	}
 	net_buf_add_le32(sk->rx.buf, sk->rx.len);
 	sk->rx.next = from_pool_add_net_buf_data(&isotp_receive_pool, sk->rx.buf, &cf->data[item], sk->rx.idx);
+	if (!sk->rx.next)
+	{
+		sk->rx.state = ISOTP_POOL_ALLOC_BUF_ERR;
+		k_timer_start(&sk->rx.timer, K_NO_WAIT, K_NO_WAIT);
+		return;
+	}
 	sk->rx.sn = 1;
 	/* send our first FC frame */
-	isotp_send_fc((struct isotp_frame *)sk->rx.focus, ISOTP_FC_CTS);
+	isotp_send_fc(sk, ISOTP_FC_CTS);
 	k_timer_start(&sk->rx.timer, K_MSEC(CONFIG_VISOTP_A_TIMEOUT), K_NO_WAIT);
 }
 
@@ -483,8 +487,9 @@ static inline void isotp_rcv_cf(struct linux_isotp_sock *sk, struct can_frame *c
 	if (sk->rx.idx >= sk->rx.len)
 	{
 		/* we are done */
-		sk->rx.state = ISOTP_WAIT_DATA_END;
-		k_timer_start(&sk->rx.timer, K_NO_WAIT, K_NO_WAIT);
+		sk->rx.state = ISOTP_WAIT_FF_SF;
+		net_buf_put(&sk->fifo, sk->rx.buf);
+		sk->rx.buf = NULL;
 		return;
 	}
 
@@ -493,57 +498,76 @@ static inline void isotp_rcv_cf(struct linux_isotp_sock *sk, struct can_frame *c
 	{
 		/* we reached the specified blocksize so->rxfc.bs */
 		sk->rx.bs = 0;
-		isotp_send_fc((struct isotp_frame *)sk->rx.focus, ISOTP_FC_CTS);
+		isotp_send_fc(sk, ISOTP_FC_CTS);
 	}
 	k_timer_start(&sk->rx.timer, K_MSEC(CONFIG_VISOTP_CR_TIMEOUT), K_NO_WAIT);
 }
 
-static void isotp_rcv(const struct device *dev, struct can_frame *frame, void *arg)
+static void receive_work_handler(struct k_work *work)
 {
-	struct linux_isotp_sock *sk = (struct linux_isotp_sock *)arg;
-	struct can_frame *cf = frame;
-	int ae = sk->rx.addr.flags & ISOTP_PKG_EXT_ADDR ? 1: 0;
-	if (!ae || cf->data[0] == sk->rx.addr.ext_addr)
-	{
-		uint8_t n_pci_type;
-		n_pci_type = cf->data[ae] & 0xF0;
-		switch (n_pci_type)
+	struct isotp_frame *frame = k_fifo_get(&receive_fifo, K_NO_WAIT);
+	while (frame) {
+		int ae = frame->sk->rx.addr.flags & ISOTP_PKG_EXT_ADDR ? 1: 0;
+		if (!ae || frame->frame.data[0] == frame->sk->rx.addr.ext_addr)
 		{
-		case N_PCI_FC:
-			/* tx path: flow control frame containing the FC parameters */
-			isotp_rcv_fc(sk, cf, ae);
-			return;
+			uint8_t n_pci_type;
+			n_pci_type = frame->frame.data[ae] & 0xF0;
+			switch (n_pci_type)
+			{
+			case N_PCI_FC:
+				/* tx path: flow control frame containing the FC parameters */
+				isotp_rcv_fc(frame->sk, &frame->frame, ae);
+				break;
 
-		case N_PCI_SF:
-			/* rx path: single frame
-			*
-			* As we do not have a rx.ll_dl configuration, we can only test
-			* if the CAN frames payload length matches the LL_DL == 8
-			* requirements - no matter if it's CAN 2.0 or CAN FD
-			*/
+			case N_PCI_SF:
+				/* rx path: single frame
+				*
+				* As we do not have a rx.ll_dl configuration, we can only test
+				* if the CAN frames payload length matches the LL_DL == 8
+				* requirements - no matter if it's CAN 2.0 or CAN FD
+				*/
 
-			/* get the SF_DL from the N_PCI byte */
-			isotp_rcv_sf(sk, cf, ae);
-			return;
+				/* get the SF_DL from the N_PCI byte */
+				isotp_rcv_sf(frame->sk, &frame->frame, ae);
+				break;
 
-		case N_PCI_FF:
-			/* rx path: first frame */
-			isotp_rcv_ff(sk, cf, ae);
-			return;
+			case N_PCI_FF:
+				/* rx path: first frame */
+				isotp_rcv_ff(frame->sk, &frame->frame, ae);
+				break;
 
-		case N_PCI_CF:
-			/* rx path: consecutive frame */
-			isotp_rcv_cf(sk, cf, ae);
-			return;
+			case N_PCI_CF:
+				/* rx path: consecutive frame */
+				isotp_rcv_cf(frame->sk, &frame->frame, ae);
+				break;
+			}
 		}
+		else
+			LOG_ERR("isotp->frame.data[0] != sk->rx.addr.ext_addr src: [%d] dst [%d]", frame->frame.data[0], frame->sk->rx.addr.ext_addr);
+		LOG_DBG("isotp_rcv work end %d", frame->frame.id);
+		memset(frame, 0, sizeof(struct isotp_frame));
+		k_mem_slab_free(&isotp_frame_slab, frame);
+		frame = k_fifo_get(&receive_fifo, K_NO_WAIT);
 	}
-	LOG_ERR("cf->data[0] != sk->rx.addr.ext_addr src: [%d] dst [%d]", cf->data[0], sk->rx.addr.ext_addr);
+}
+
+static void isotp_rcv(const struct device *dev, struct can_frame *cf, void *arg)
+{
+	struct isotp_frame *frame = NULL;
+	if (!k_mem_slab_alloc(&isotp_frame_slab, (void **)&frame, K_NO_WAIT))
+	{
+		memcpy(&frame->frame, cf, sizeof(struct can_frame));
+		frame->sk = arg;
+		k_fifo_alloc_put(&receive_fifo, frame);
+		int ret = k_work_submit(&receive_work);
+		LOG_DBG("isotp_rcv frame start %d", ret);
+		return;
+	}
+	LOG_ERR("isotp_rcv k_mem_slab_alloc: NULL");
 }
 
 int64_t isotp_recv(struct linux_isotp_sock *sk, struct net_buf **buffer, k_timeout_t timeout)
 {
-	__ASSERT(sk, "sock is NULL");
-
 	k_mutex_lock(&sk->mutex, K_FOREVER);
 	int close = sk->close & ISOTP_SOCK_CLOSE;
 	int64_t len = -1;
@@ -564,17 +588,16 @@ int64_t isotp_recv(struct linux_isotp_sock *sk, struct net_buf **buffer, k_timeo
 static void isotp_sk_close_work_handler(struct k_work *work)
 {
 	struct linux_isotp_sock *sk = CONTAINER_OF(CONTAINER_OF(work, struct k_work_delayable, work), struct linux_isotp_sock, work);
-	if (((struct isotp_frame *)sk->rx.focus)->send_num || ((struct isotp_frame *)sk->tx.focus)->send_num)
-	{
-		LOG_WRN("rx_send_num[%lld] tx_send_num[%lld] %p", ((struct isotp_frame *)sk->rx.focus)->send_num, ((struct isotp_frame *)sk->tx.focus)->send_num, sk);
-		k_work_schedule(&sk->work, K_SECONDS(1));
-		return;
-	}
-		
 	if (sk->rx.state != ISOTP_WAIT_FF_SF || sk->tx.state != ISOTP_IDLE)
 	{
 		LOG_DBG("state...... %p", sk);
 		k_work_schedule(&sk->work, K_MSEC(100));
+		return;
+	}
+	if (sk->send_num)
+	{
+		LOG_WRN("send_num[%lld] %p", sk->send_num, sk);
+		k_work_schedule(&sk->work, K_MSEC(500));
 		return;
 	}
 	k_timer_stop(&sk->tx.timer);
@@ -592,25 +615,20 @@ static void isotp_sk_close_work_handler(struct k_work *work)
 	k_fifo_cancel_wait(&sk->fifo);
 	net_buf_unref(sk->rx.buf);
 	net_buf_unref(sk->tx.buf);
-	k_mem_slab_free(&isotp_frame_slab, sk->rx.focus);
-	k_mem_slab_free(&isotp_frame_slab, sk->tx.focus);
-	k_mutex_lock(&sk_list_mutex, K_FOREVER);
-	for (int idx = 0; idx < CONFIG_CAN_MAX_FILTER; idx++)
-	{
-		if (sk_list[idx] == sk)
-		{
-			k_mutex_lock(&sk->mutex, K_FOREVER);
-			sk->close |= ISOTP_SOCK_CLOSE;
-			k_mutex_unlock(&sk->mutex);
-			break;
-		}
-	}
-	k_mutex_unlock(&sk_list_mutex);
+	k_mutex_lock(&sk->mutex, K_FOREVER);
+	sk->close |= ISOTP_SOCK_CLOSE;
+	k_mutex_unlock(&sk->mutex);
+	k_mem_slab_free(&isotp_sock_slab, sk);
 	LOG_DBG("close end....... %p", sk);
 }
 
 struct linux_isotp_sock *isotp_init(const struct device *can_dev, struct isotp_pkg_id rxaddr, struct isotp_pkg_id txaddr, struct isotp_fc_opts rxfc)
 {
+	if (!can_dev)
+	{
+		LOG_ERR("can_dev is NULL");
+		return NULL;
+	}
 	if (rxaddr.flags & ISOTP_PKG_FDF || txaddr.flags & ISOTP_PKG_FDF)
 	{
 		can_mode_t cap;
@@ -620,78 +638,28 @@ struct linux_isotp_sock *isotp_init(const struct device *can_dev, struct isotp_p
 			return NULL;
 		}
 	}
-	struct linux_isotp_sock tmp = {
-		.can_dev = can_dev, .close = ISOTP_SOCK_CLOSE, .tx_gap = {},
-		.filter_id = 0, .fifo = {}, .callback = NULL, .args = NULL,
-		.rx = { .addr = rxaddr, .fc = rxfc, .state = ISOTP_WAIT_FF_SF },
-		.tx = { .addr = txaddr, .state = ISOTP_IDLE }
-	};
-	struct isotp_frame *frame;
-	if (k_mem_slab_alloc(&isotp_frame_slab, (void **)&frame, K_NO_WAIT))
-	{
-		LOG_ERR("isotp_frame_slab k_mem_slab_alloc: NULL");
-		return NULL;
-	}
-	frame->send_num = 0;
-	tmp.rx.focus = &frame->frame;
-	if (k_mem_slab_alloc(&isotp_frame_slab, (void **)&frame, K_NO_WAIT))
-	{
-		LOG_ERR("isotp_frame_slab k_mem_slab_alloc: NULL");
-		k_mem_slab_free(&isotp_frame_slab, tmp.rx.focus);
-		return NULL;
-	}
-	frame->send_num = 0;
-	tmp.tx.focus = &frame->frame;
 	struct linux_isotp_sock *sk = NULL;
 
-	k_mutex_lock(&sk_list_mutex, K_FOREVER);
-	for (int idx = 0; idx < CONFIG_CAN_MAX_FILTER; idx++)
-	{
-		if (!sk_list[idx])
-		{
-			if (k_mem_slab_alloc(&isotp_sock_slab, (void **)&sk, K_NO_WAIT))
-				break;
-			*sk = tmp;
-			sk_list[idx] = sk;
-			k_fifo_init(&sk->fifo);
-			k_timer_init(&sk->tx.timer, send_timeout_handler, NULL);
-			k_timer_init(&sk->rx.timer, receive_timeout_handler, NULL);
-			k_mutex_init(&sk->mutex);
-			k_work_init_delayable(&sk->work, isotp_sk_close_work_handler);
-		}
-		sk = sk_list[idx];
-		k_mutex_lock(&sk->mutex, K_FOREVER);
-		// 
-		if (sk->rx.addr.ext_id == tmp.rx.addr.ext_id) {
-			if (sk->close & ISOTP_SOCK_CLOSE) {
-				((struct isotp_frame *)tmp.rx.focus)->sk = sk;
-				((struct isotp_frame *)tmp.tx.focus)->sk = sk;
-				sk->rx.addr = tmp.rx.addr;
-				sk->tx.addr = tmp.tx.addr;
-				sk->rx.fc = tmp.rx.fc;
-				sk->tx.fc = tmp.tx.fc;
-				sk->rx.focus = tmp.rx.focus;
-				sk->tx.focus = tmp.tx.focus;
-				sk->close = 0;
-				k_mutex_unlock(&sk->mutex);
-				break;
-			}
-			k_mutex_unlock(&sk->mutex);
-			LOG_ERR("ext_id[%d] is useing", tmp.rx.addr.ext_id);
-			sk = NULL;
-			break;
-		}
-		k_mutex_unlock(&sk->mutex);
-		sk = NULL;
-	}
-	k_mutex_unlock(&sk_list_mutex);
-	if (!sk)
+	if (k_mem_slab_alloc(&isotp_sock_slab, (void **)&sk, K_NO_WAIT))
 	{
 		LOG_ERR("not free sock list");
-		k_mem_slab_free(&isotp_frame_slab, tmp.rx.focus);
-		k_mem_slab_free(&isotp_frame_slab, tmp.tx.focus);
 		return NULL;
 	}
+	memset(sk, 0, sizeof(struct linux_isotp_sock));
+	k_fifo_init(&sk->fifo);
+	k_timer_init(&sk->tx.timer, send_timeout_handler, NULL);
+	k_timer_init(&sk->rx.timer, receive_timeout_handler, NULL);
+	k_mutex_init(&sk->mutex);
+	k_work_init_delayable(&sk->work, isotp_sk_close_work_handler);
+	k_mutex_lock(&sk->mutex, K_FOREVER);
+	sk->can_dev = can_dev;
+	sk->rx.addr = rxaddr;
+	sk->tx.addr = txaddr;
+	sk->rx.fc = rxfc;
+	sk->rx.state = ISOTP_WAIT_FF_SF;
+	sk->tx.state = ISOTP_IDLE;
+	set_gap(&sk->rx.fc);
+	k_mutex_unlock(&sk->mutex);
 
 	struct can_filter filter;
 	filter.id = sk->rx.addr.ext_id;
@@ -714,50 +682,39 @@ struct linux_isotp_sock *isotp_init(const struct device *can_dev, struct isotp_p
 #else
 	#error No need to compile this out-of-tree driver! ISO-TP is part of Linux Mainline kernel since Linux 5.10.
 #endif
+	sk->filter_id = can_add_rx_filter(sk->can_dev, isotp_rcv, sk, &filter);
 	if (sk->filter_id < 1)
 	{
-		int fid = can_add_rx_filter(sk->can_dev, isotp_rcv, sk, &filter);
-		if (fid < 1) {
-			sk->close |= ISOTP_SOCK_STOP | ISOTP_SOCK_CLOSE;
-			LOG_ERR("Error adding FC filter [%d]", fid);
-			k_mem_slab_free(&isotp_frame_slab, tmp.rx.focus);
-			k_mem_slab_free(&isotp_frame_slab, tmp.tx.focus);
-			return NULL;
-		}
-		sk->filter_id = fid;
+		sk->close |= ISOTP_SOCK_STOP | ISOTP_SOCK_CLOSE;
+		LOG_ERR("Error adding FC filter [%d]", sk->filter_id);
+		k_mem_slab_free(&isotp_sock_slab, sk);
+		return NULL;
 	}
-	LOG_ERR("Error adding FC filter 1 [%d] [%p]", sk->filter_id, sk);
 	return sk;
 }
 
 void isotp_close(struct linux_isotp_sock *sk)
 {
-	__ASSERT(sk, "sock is NULL");
+	can_remove_rx_filter(sk->can_dev, sk->filter_id);
 	k_mutex_lock(&sk->mutex, K_FOREVER);
 	sk->close |= ISOTP_SOCK_STOP;
 	k_mutex_unlock(&sk->mutex);
-	k_work_schedule(&sk->work, K_NO_WAIT);
+	k_work_schedule(&sk->work, K_SECONDS(3));
 }
 
 static void isotp_send_flow_frame_cb(const struct device *dev, int error, void *arg)
 {
 	struct isotp_frame *frame = (struct isotp_frame *)arg;
-	if (!frame->send_num)
+	frame->sk->send_num--;
+	if (error)
 	{
-		LOG_ERR("isotp_send_flow_frame_cb send_num is zero");
-		return;
+		k_timer_stop(&frame->sk->tx.timer);
+		frame->sk->tx.state = ISOTP_SEND_ERR;
+		k_timer_start(&frame->sk->tx.timer, K_NO_WAIT, K_NO_WAIT);
+		LOG_ERR("send flow frame error: [%d]", error);
 	}
-	frame->send_num--;
-	if (!frame->send_num)
+	else
 	{
-		if (error)
-		{
-			k_timer_stop(&frame->sk->tx.timer);
-			frame->sk->tx.state = ISOTP_SEND_ERR;
-			k_timer_start(&frame->sk->tx.timer, K_NO_WAIT, K_NO_WAIT);
-			LOG_ERR("send flow frame error: [%d]", error);
-			return;
-		}
 		k_timeout_t tx_gap = K_NO_WAIT;
 		switch (frame->sk->tx.state)
 		{
@@ -765,40 +722,34 @@ static void isotp_send_flow_frame_cb(const struct device *dev, int error, void *
 			frame->sk->tx.state = ISOTP_SENDING;
 			k_timer_stop(&frame->sk->tx.timer);
 			if (frame->sk->tx.fc.stmin)
-				tx_gap = frame->sk->tx_gap;
+				tx_gap = frame->sk->tx.fc.gap;
 			k_timer_start(&frame->sk->tx.timer, tx_gap, K_NO_WAIT);
 		}
 	}
+	memset(frame, 0, sizeof(struct isotp_frame));
+	k_mem_slab_free(&isotp_frame_slab, frame);
 }
 
 static void sf_ff_wait_end_frame_cb(const struct device *dev, int error, void *arg)
 {
 	struct isotp_frame *frame = (struct isotp_frame *)arg;
-	if (!frame->send_num)
+	frame->sk->send_num--;
+	if (error)
 	{
-		LOG_ERR("sf_ff_wait_end_frame_cb send_num is zero");
-		return;
+		k_timer_stop(&frame->sk->tx.timer);
+		frame->sk->tx.state = ISOTP_SEND_ERR;
+		k_timer_start(&frame->sk->tx.timer, K_NO_WAIT, K_NO_WAIT);
+		LOG_ERR("send sf/ff/wait cf/end frame error: [%d]", error);
 	}
-	frame->send_num--;
-	if (!frame->send_num)
+	else
 	{
-		if (error)
-		{
-			k_timer_stop(&frame->sk->tx.timer);
-			frame->sk->tx.state = ISOTP_SEND_ERR;
-			k_timer_start(&frame->sk->tx.timer, K_NO_WAIT, K_NO_WAIT);
-			LOG_ERR("send sf/ff/wait cf/end frame error: [%d]", error);
-			return;
-		}
 		switch (frame->sk->tx.state)
 		{
 		case ISOTP_SEND_SF:
 		case ISOTP_SEND_END:
 			k_timer_stop(&frame->sk->tx.timer);
-			inline_callback_timer(frame->sk->callback, ISOTP_N_OK, frame->sk->args);
-			frame->sk->callback = NULL;
-			frame->sk->tx.state = ISOTP_IDLE;
-			net_buf_unref(frame->sk->tx.buf);
+			frame->sk->tx.state = ISOTP_SEND_END_OK;
+			k_timer_start(&frame->sk->tx.timer, K_NO_WAIT, K_NO_WAIT);
 			break;
 
 		case ISOTP_WAIT_FC_START:
@@ -809,6 +760,8 @@ static void sf_ff_wait_end_frame_cb(const struct device *dev, int error, void *a
 			frame->sk->tx.state = ISOTP_WAIT_FIRST_FC;
 		}
 	}
+	memset(frame, 0, sizeof(struct isotp_frame));
+	k_mem_slab_free(&isotp_frame_slab, frame);
 }
 
 static int isotp_send_sf(struct linux_isotp_sock *sk) {
@@ -821,7 +774,13 @@ static int isotp_send_sf(struct linux_isotp_sock *sk) {
 	 * This prevents a protocol caused length extension from
 	 * CAN_DL = 8 to CAN_DL = 12 due to the SF_SL ESC handling.
 	 */
-	struct isotp_frame *frame = (struct isotp_frame *)sk->tx.focus;
+	struct isotp_frame *frame = NULL;
+	if (k_mem_slab_alloc(&isotp_frame_slab, (void **)&frame, K_NO_WAIT))
+	{
+		LOG_ERR("isotp_frame_slab k_mem_slab_alloc: NULL");
+		return 1;
+	}
+	frame->sk = sk;
 	frame->frame.dlc = sk->tx.addr.dlc;
 	int8_t item = 0;
 	if (sk->tx.addr.flags & ISOTP_PKG_EXT_ADDR)
@@ -847,7 +806,13 @@ static int isotp_send_sf(struct linux_isotp_sock *sk) {
 }
 
 static int isotp_send_ff(struct linux_isotp_sock *sk) {
-	struct isotp_frame *frame = (struct isotp_frame *)sk->tx.focus;
+	struct isotp_frame *frame = NULL;
+	if (k_mem_slab_alloc(&isotp_frame_slab, (void **)&frame, K_NO_WAIT))
+	{
+		LOG_ERR("isotp_frame_slab k_mem_slab_alloc: NULL");
+		return 1;
+	}
+	frame->sk = sk;
 	frame->frame.dlc = sk->tx.addr.dlc;
 	int8_t item = 0;
 	if (sk->tx.addr.flags & ISOTP_PKG_EXT_ADDR)
@@ -883,7 +848,13 @@ static int isotp_send_ff(struct linux_isotp_sock *sk) {
 
 static inline int isotp_send_cf(struct linux_isotp_sock *sk)
 {
-	struct isotp_frame *frame = (struct isotp_frame *)sk->tx.focus;
+	struct isotp_frame *frame = NULL;
+	if (k_mem_slab_alloc(&isotp_frame_slab, (void **)&frame, K_NO_WAIT))
+	{
+		LOG_ERR("isotp_frame_slab k_mem_slab_alloc: NULL");
+		return 1;
+	}
+	frame->sk = sk;
 	int8_t item = 0;
 	if (sk->tx.addr.flags & ISOTP_PKG_EXT_ADDR)
 		frame->frame.data[item++] = sk->tx.addr.ext_addr;
@@ -924,8 +895,6 @@ static inline int isotp_send_cf(struct linux_isotp_sock *sk)
 
 int isotp_send(struct linux_isotp_sock *sk, uint8_t *data, size_t len, isotp_callback complete_cb, void *cb_arg)
 {
-	__ASSERT(sk, "sock is NULL");
-
 	k_mutex_lock(&sk->mutex, K_FOREVER);
 	int close = sk->close & ISOTP_SOCK_STOP;
 	k_mutex_unlock(&sk->mutex);
@@ -938,6 +907,7 @@ int isotp_send(struct linux_isotp_sock *sk, uint8_t *data, size_t len, isotp_cal
 		return 1;
 	}
 	sk->tx.state = ISOTP_WAIT_FIRST_FC;
+	net_buf_unref(sk->tx.buf);
 	sk->tx.buf = net_buf_alloc_fixed(&isotp_send_pool, K_NO_WAIT);
 	if (!sk->tx.buf)
 	{
@@ -966,11 +936,10 @@ int isotp_send(struct linux_isotp_sock *sk, uint8_t *data, size_t len, isotp_cal
 		sk->tx.state = ISOTP_IDLE;
 		return 1;
 	}
-	
+	k_timer_stop(&sk->tx.timer);
 	int ret = func(sk);
 	if (ret)
 	{
-		k_timer_stop(&sk->tx.timer);
 		sk->tx.state = ISOTP_SEND_ERR;
 		k_timer_start(&sk->tx.timer, K_NO_WAIT, K_NO_WAIT);
 		LOG_ERR("send first or single frame error: [%d]", ret);

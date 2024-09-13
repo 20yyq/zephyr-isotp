@@ -128,10 +128,10 @@ struct isotp_pkg_id {
 struct isotp_fc_opts {
 	uint8_t bs;    /**< Block size. Number of CF PDUs before next CF is sent */
 	uint8_t stmin; /**< Minimum separation time. Min time between frames */
+	k_timeout_t gap;
 };
 
 struct tpconn {
-	struct can_frame *focus;
 	struct k_timer timer;
 	uint32_t idx;
 	uint32_t len;
@@ -149,8 +149,8 @@ struct linux_isotp_sock {
 	int close;
 	struct k_mutex mutex;
 	struct k_work_delayable work;
-	k_timeout_t tx_gap;
 	int filter_id;
+	uint64_t send_num;
 	struct tpconn rx, tx;
 	struct k_fifo fifo;
 	isotp_callback callback;
