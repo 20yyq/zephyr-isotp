@@ -1,14 +1,13 @@
 /*
  * @Author       : Eacher
  * @Date         : 2024-07-10 10:00:22
- * @LastEditTime : 2024-07-19 15:19:27
- * @LastEditors  : Eacher
+ * @LastEditTime: 2025-03-01 08:20:24
+ * @LastEditors: Eacher
  * --------------------------------------------------------------------------------<
  * @Description  : 
  * --------------------------------------------------------------------------------<
  * @FilePath     : /zephyrproject/veryark/application/lib/isotp/isotp.c
  */
-#include "version.h"
 #include <stdbool.h>
 #include <string.h>
 #include <zephyr/drivers/can.h>
@@ -91,25 +90,19 @@ K_MEM_SLAB_DEFINE(isotp_callback_timer_slab, sizeof(struct callback_timer), CONF
 
 static inline struct net_buf *from_pool_add_net_buf_data(struct net_buf_pool *pool, struct net_buf *buf, uint8_t *data, size_t len)
 {
-	uint16_t max, idx, item;
+	uint16_t umax = 65535, idx = 0, item;
+	int max;
 	item = len;
 	do
 	{
 		max = net_buf_tailroom(buf);
-		if (max < 0)
+		if (idx == umax || max < 1)
 		{
-			LOG_ERR("net_buf buffer is NULL");
-			return NULL;
-		}
-		for (idx = 0; idx < max; idx++)
-		{
-			net_buf_add_u8(buf, data[len - item]);
-			item--;
-			if (!item)
-				break;
-		}
-		if (idx == max)
-		{
+			if (max < 0)
+			{
+				LOG_ERR("net_buf buffer is NULL max[%d]", max);
+				return NULL;
+			}
 			buf->frags = net_buf_alloc_fixed(pool, K_NO_WAIT);
 			buf = buf->frags;
 			if (!buf)
@@ -118,6 +111,14 @@ static inline struct net_buf *from_pool_add_net_buf_data(struct net_buf_pool *po
 				break;
 			}
 		}
+		for (idx = 0; idx < max; idx++)
+		{
+			net_buf_add_u8(buf, data[len - item]);
+			item--;
+			if (!item)
+				break;
+		}
+		umax = max;
 	} while (item);
 	return buf;
 }
@@ -169,18 +170,21 @@ static void receive_timeout_handler(struct k_timer *timer)
 		LOG_ERR("ISOTP_POOL_ALLOC_BUF_ERR");
 		sk->rx.state = ISOTP_WAIT_FF_SF;
 		net_buf_unref(sk->rx.buf);
+		sk->rx.buf = NULL;
 		break;
 
 	case ISOTP_SEND_FC_ERR:
 		LOG_ERR("ISOTP_SEND_FC_ERR");
 		sk->rx.state = ISOTP_WAIT_FF_SF;
 		net_buf_unref(sk->rx.buf);
+		sk->rx.buf = NULL;
 		break;
 
 	case ISOTP_WAIT_DATA:
 		LOG_ERR("ISOTP_WAIT_DATA timeout");
 		sk->rx.state = ISOTP_WAIT_FF_SF;
 		net_buf_unref(sk->rx.buf);
+		sk->rx.buf = NULL;
 		break;
 	}
 	return;
@@ -344,6 +348,7 @@ static inline void isotp_rcv_sf(struct linux_isotp_sock *sk, struct can_frame *c
 		LOG_ERR("sk->rx.state != VISOTP_RX_STATE_WAIT_SF state: [%d]", sk->rx.state);
 		return;
 	}
+	k_timer_stop(&sk->rx.timer);
 	sk->rx.state = ISOTP_IDLE;
 	sk->rx.len = cf->data[item] & 0x0F;
 	int sf_dl = 1;
@@ -371,6 +376,7 @@ static inline void isotp_rcv_sf(struct linux_isotp_sock *sk, struct can_frame *c
 		LOG_ERR("sf from_pool_add_net_buf_data net buf == NULL");
 		sk->rx.state = ISOTP_WAIT_FF_SF;
 		net_buf_unref(sk->rx.buf);
+		sk->rx.buf = NULL;
 		return;
 	}
 	net_buf_put(&sk->fifo, sk->rx.buf);
@@ -385,6 +391,7 @@ static inline void isotp_rcv_ff(struct linux_isotp_sock *sk, struct can_frame *c
 		LOG_ERR("sk->rx.state != VISOTP_RX_STATE_WAIT_FF state: [%d] len [%d] idx [%d]", sk->rx.state, sk->rx.len, sk->rx.idx);
 		return;
 	}
+	k_timer_stop(&sk->rx.timer);
 	sk->rx.state = ISOTP_WAIT_DATA;
 
 	/* get the used sender LL_DL from the (first) CAN frame data length */
@@ -695,11 +702,16 @@ struct linux_isotp_sock *isotp_init(const struct device *can_dev, struct isotp_p
 
 void isotp_close(struct linux_isotp_sock *sk)
 {
-	can_remove_rx_filter(sk->can_dev, sk->filter_id);
-	k_mutex_lock(&sk->mutex, K_FOREVER);
-	sk->close |= ISOTP_SOCK_STOP;
-	k_mutex_unlock(&sk->mutex);
-	k_work_schedule(&sk->work, K_SECONDS(3));
+	if (sk)
+	{
+		can_remove_rx_filter(sk->can_dev, sk->filter_id);
+		k_mutex_lock(&sk->mutex, K_FOREVER);
+		sk->close |= ISOTP_SOCK_STOP;
+		k_mutex_unlock(&sk->mutex);
+		k_work_schedule(&sk->work, K_SECONDS(3));
+		return;
+	}
+	LOG_ERR("sock is NULL");
 }
 
 static void isotp_send_flow_frame_cb(const struct device *dev, int error, void *arg)
@@ -934,6 +946,7 @@ int isotp_send(struct linux_isotp_sock *sk, uint8_t *data, size_t len, isotp_cal
 		net_buf_unref(sk->tx.next);
 		LOG_ERR("pool_alloc_buffer net buf == NULL");
 		sk->tx.state = ISOTP_IDLE;
+		sk->tx.buf = NULL;
 		return 1;
 	}
 	k_timer_stop(&sk->tx.timer);

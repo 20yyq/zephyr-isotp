@@ -1,8 +1,8 @@
 /*
  * @Author       : Eacher
  * @Date         : 2024-07-10 10:02:04
- * @LastEditTime : 2024-07-19 14:24:12
- * @LastEditors  : Eacher
+ * @LastEditTime: 2025-03-01 08:20:17
+ * @LastEditors: Eacher
  * --------------------------------------------------------------------------------<
  * @Description  : 
  * --------------------------------------------------------------------------------<
@@ -11,8 +11,17 @@
 
 #ifndef __VERYARK_ISOTP_H_
 #define __VERYARK_ISOTP_H_
+#include <version.h>
 #include <zephyr/kernel.h>
+#if KERNEL_VERSION_NUMBER >= ZEPHYR_VERSION(4,0,0)
+
+#include <zephyr/net_buf.h>
+
+#else
+
 #include <zephyr/net/buf.h>
+
+#endif
 
 /**
  * @name CAN frame flags
