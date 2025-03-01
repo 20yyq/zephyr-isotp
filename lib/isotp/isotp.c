@@ -1,7 +1,7 @@
 /*
  * @Author       : Eacher
  * @Date         : 2024-07-10 10:00:22
- * @LastEditTime: 2025-03-01 08:20:24
+ * @LastEditTime: 2025-03-01 08:46:46
  * @LastEditors: Eacher
  * --------------------------------------------------------------------------------<
  * @Description  : 
@@ -96,7 +96,7 @@ static inline struct net_buf *from_pool_add_net_buf_data(struct net_buf_pool *po
 	do
 	{
 		max = net_buf_tailroom(buf);
-		if (idx == umax || max < 1)
+		if ((umax && idx == umax) || max < 1)
 		{
 			if (max < 0)
 			{
